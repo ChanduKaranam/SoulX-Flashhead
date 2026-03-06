@@ -25,11 +25,11 @@ class SessionManager:
         stream_v.width = width
         stream_v.height = height
         stream_v.pix_fmt = 'yuv420p'
-        # Some x264 options for low-latency streaming
+        # Use a reasonable bitrate instead of just ultrafast CRF, which can explode in file size for streaming
+        stream_v.bit_rate = 2000000 # 2 Mbps
         stream_v.options = {
-            'preset': 'ultrafast',
-            'tune': 'zerolatency',
-            'crf': '23'
+            'preset': 'veryfast',
+            'tune': 'zerolatency'
         }
 
         # Add Audio Stream (AAC)

@@ -119,6 +119,14 @@ async def generation_worker():
             av_buffer.seek(start_pos)
             muxed_bytes = av_buffer.read()
             
+            # CLEAR THE BUFFER so we don't hold the entire video history in RAM 
+            # and resend the history on every chunk
+            av_buffer.seek(0)
+            av_buffer.truncate(0)
+            # Because we truncated the underlying python buffer, we must tell PyAV 
+            # to reset its internal pointers so the next mux appended starts at byte 0
+            state["av_container"].seek(0)
+            
             # Send the encoded MPEG-TS chunk back to the client!
             if muxed_bytes:
                 await ws.send_bytes(muxed_bytes)
