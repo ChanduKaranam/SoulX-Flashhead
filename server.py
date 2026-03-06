@@ -79,7 +79,17 @@ async def generation_worker():
             # Serialize and send back the frame bytes
             # For this MVP, we convert the torch tensor to a raw byte array
             frames_np = normalized_frames.cpu().numpy().astype(np.uint8)
-            await ws.send_bytes(frames_np.tobytes())
+            
+            try:
+                await ws.send_bytes(frames_np.tobytes())
+            except RuntimeError as e:
+                # This happens if the client disconnects and the ASGI connection is already closed
+                logger.warning(f"Failed to send chunk for session {session_id}, dropping: {str(e)}")
+                # We can explicitly remove them from session manager cleanly
+                session_manager.delete_session(session_id)
+            except WebSocketDisconnect:
+                logger.warning(f"Client disconnected while sending chunk {session_id}")
+                session_manager.delete_session(session_id)
 
         except Exception as e:
             import traceback
