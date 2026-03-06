@@ -19,4 +19,3 @@ xformers==0.0.31
 librosa
 mediapipe==0.10.9
 flask
-nvidia-nccl-cu12==2.27.3

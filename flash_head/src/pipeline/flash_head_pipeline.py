@@ -314,3 +314,154 @@ class FlashHeadPipeline:
         gen_video_samples = videos #[:, :, self.motion_frames_num:]
 
         return gen_video_samples[0].to(torch.float32)
+
+    @torch.no_grad()
+    def prepare_params_stateless(self,
+                        cond_image_path_or_dir,
+                        target_size,
+                        frame_num,
+                        motion_frames_num,
+                        sampling_steps,
+                        seed=None,
+                        shift=5.0,
+                        color_correction_strength=0.0,
+                        use_face_crop=False,
+                        ):
+        """
+        Returns a dictionary of conditions for multiple unique people/images.
+        Does NOT store original_color_reference or latent_motion_frames purely on self.
+        """
+        cond_image_dict = get_cond_image_dict(cond_image_path_or_dir, use_face_crop)
+
+        self.frame_num = frame_num
+        self.motion_frames_num = motion_frames_num
+        self.color_correction_strength = color_correction_strength
+
+        self.target_h, self.target_w = target_size
+        self.lat_h, self.lat_w = self.target_h // self.config.vae_stride[1], self.target_w // self.config.vae_stride[2]
+
+        self.generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        # prepare timesteps
+        if sampling_steps == 2:
+            timesteps = [1000, 500]
+        elif sampling_steps == 4:
+            timesteps = [1000, 750, 500, 250]
+        else:
+            timesteps = list(np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32))
+            
+        timesteps.append(0.)
+        timesteps = [torch.tensor([t], device=self.device) for t in timesteps]
+        if self.use_timestep_transform:
+            timesteps = [timestep_transform(t, shift=shift, num_timesteps=self.num_timesteps) for t in timesteps]
+        self.timesteps = timesteps
+
+        state_dict = {}
+        for i, (person_name, cond_image_pil) in enumerate(cond_image_dict.items()):
+            cond_image_tensor = resize_and_centercrop(cond_image_pil, (self.target_h, self.target_w)).to(self.device, dtype=self.param_dtype) # 1 C 1 H W
+            cond_image_tensor = (cond_image_tensor / 255 - 0.5) * 2
+
+            video_frames = cond_image_tensor.repeat(1, 1, self.frame_num, 1, 1)
+            ref_img_latent = self.vae.encode(video_frames) # (16, 9, 64, 64) / (128, 5, 16, 16)
+            
+            latent_motion_frames = ref_img_latent[:, :1].clone()
+
+            state_dict[person_name] = {
+                "original_color_reference": cond_image_tensor.cpu(),
+                "ref_img_latent": ref_img_latent.cpu(),
+                "latent_motion_frames": latent_motion_frames.cpu()
+            }
+
+        return state_dict
+
+    @torch.no_grad()
+    def generate_stateless(self, audio_embedding, session_state):
+        """
+        Stateless generate: Takes an audio chunk and the user's specific state dict.
+        Returns (generated_frames, modified_session_state).
+        """
+        # Load state onto device
+        original_color_reference = session_state["original_color_reference"].to(self.device)
+        ref_img_latent = session_state["ref_img_latent"].to(self.device)
+        latent_motion_frames = session_state["latent_motion_frames"].to(self.device)
+        audio_embedding = audio_embedding.to(self.device)
+
+        # evaluation mode
+        with torch.no_grad():
+            # sample videos
+            noise = torch.randn(
+                self.config.out_dim, 
+                (self.frame_num - 1) // self.config.vae_stride[0] + 1,
+                self.lat_h,
+                self.lat_w,
+                dtype=self.param_dtype,
+                device=self.device,
+                generator=self.generator)
+
+            for i in range(len(self.timesteps)-1):
+                torch.cuda.synchronize()
+                start_time = time.time()
+
+                noise[:, :latent_motion_frames.shape[1]] = latent_motion_frames
+
+                flow_pred = self.model(
+                    x=noise.unsqueeze(0),
+                    timestep=self.timesteps[i],
+                    context=audio_embedding,
+                    y=ref_img_latent.unsqueeze(0),
+                )[0]
+
+                if self.model_type == "pretrained":
+                    flow_pred_drop_audio = self.model(
+                        x=noise.unsqueeze(0),
+                        timestep=self.timesteps[i],
+                        context=torch.zeros_like(audio_embedding),
+                        y=ref_img_latent.unsqueeze(0),
+                    )[0]
+                    flow_pred = flow_pred_drop_audio + self.audio_guide_scale * (flow_pred - flow_pred_drop_audio)
+
+                    # update latent
+                    dt = self.timesteps[i] - self.timesteps[i + 1]
+                    dt = (dt / self.num_timesteps).to(self.param_dtype)
+                    noise = noise - flow_pred * dt[:, None, None, None]
+                else:
+                    # update latent
+                    t_i = (self.timesteps[i][:, None, None, None] / self.num_timesteps).to(self.param_dtype)
+                    t_i_1 = (self.timesteps[i+1][:, None, None, None] / self.num_timesteps).to(self.param_dtype)
+                    x_0 = noise - flow_pred * t_i
+
+                    noise = (1 - t_i_1) * x_0 + t_i_1 * torch.randn(x_0.size(), dtype=x_0.dtype, device=self.device, generator=self.generator)
+
+                torch.cuda.synchronize()
+                end_time = time.time()
+                if self.rank == 0:
+                    print(f'[stateless generate] model denoise step: {end_time - start_time}s')
+
+            noise[:, :latent_motion_frames.shape[1]] = latent_motion_frames
+
+            torch.cuda.synchronize()
+            start_decode_time = time.time()
+            videos = self.vae.decode(noise)
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                print(f'[stateless generate] decode video frames: {time.time() - start_decode_time}s')
+        
+        torch.cuda.synchronize()
+        if self.color_correction_strength > 0.0:
+            videos = match_and_blend_colors_torch(videos, original_color_reference, self.color_correction_strength)
+
+        cond_frame = videos[:, :, -self.motion_frames_num:].to(self.device)
+        torch.cuda.synchronize()
+
+        torch.cuda.synchronize()
+        start_encode_time = time.time()
+        latent_motion_frames = self.vae.encode(cond_frame)
+        torch.cuda.synchronize()
+        if self.rank == 0:
+            print(f'[stateless generate] encode motion frames: {time.time() - start_encode_time}s')
+
+        # Update Session State
+        session_state["latent_motion_frames"] = latent_motion_frames.cpu()
+
+        return videos[0].to(torch.float32), session_state
+
