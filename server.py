@@ -15,6 +15,7 @@ app = FastAPI()
 # Global state hold
 pipeline = None
 session_manager = SessionManager()
+global_initial_state_dict = None
 
 # Global generation queue to serialize GPU requests for the single pipeline
 generation_queue = asyncio.Queue()
@@ -100,18 +101,10 @@ async def startup_event():
 
     logger.info(f"Pipeline Loaded Successfully. Spinning up worker. Slice size: {slice_len}")
     
-    # Start the continuous worker
-    asyncio.create_task(generation_worker())
-
-@app.websocket("/ws/stream")
-async def stream_websocket(ws: WebSocket):
-    await ws.accept()
-    session_id = str(id(ws)) # Simple unique session ID
-
-    # Read the initial payload containing the condition image
-    # Note: For true production, you would send the image bytes over WS. 
-    # Here we simulate by reading the examples/girl.png path just to test the concurrent engine.
-    initial_state_dict = pipeline.prepare_params_stateless(
+    # Pre-compute the initial state dictionary globally so it doesn't block WebSockets
+    logger.info("Pre-computing initial latents for 'examples/girl.png'...")
+    global global_initial_state_dict
+    global_initial_state_dict = pipeline.prepare_params_stateless(
         cond_image_path_or_dir="examples/girl.png",
         target_size=(infer_params['height'], infer_params['width']),
         frame_num=infer_params['frame_num'],
@@ -122,10 +115,26 @@ async def stream_websocket(ws: WebSocket):
         color_correction_strength=infer_params['color_correction_strength'],
         use_face_crop=False
     )
+    logger.info("Initial latent state cached. Ready for client connections.")
+
+    # Start the continuous worker
+    asyncio.create_task(generation_worker())
+
+@app.websocket("/ws/stream")
+async def stream_websocket(ws: WebSocket):
+    await ws.accept()
+    session_id = str(id(ws)) # Simple unique session ID
+
+    # Use the globally pre-compiled state so connection is instant
+    # Note: For multiple users in a real app, this state would be compiled per user based on
+    # their uploaded photo BEFORE they connect via WebSockets.
+    state = global_initial_state_dict["girl"]
     
-    # Extract the state for the 'girl' image specifically
-    state = initial_state_dict["girl"]
-    session_manager.create_session(session_id, state)
+    # We must deep copy the state because multiple users cannot modify the same latents dictionary in memory
+    import copy
+    user_state = copy.deepcopy(state)
+    
+    session_manager.create_session(session_id, user_state)
 
     # Deque to handle sliding window audio padding, exact same as `generate_video.py`
     cached_audio_length_sum = sample_rate * cached_audio_duration
