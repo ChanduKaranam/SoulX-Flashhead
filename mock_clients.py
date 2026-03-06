@@ -2,6 +2,7 @@ import asyncio
 import websockets
 import librosa
 import numpy as np
+import imageio
 
 async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate, tgt_fps):
     """
@@ -24,6 +25,9 @@ async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate,
     print(f"[Client {client_id}] Connecting to {server_uri}...")
     # Increase ping timeout so the client doesn't drop the connection while the server GPU is busy
     # Set max_size to None because a chunk of 28 uncompressed RGB frames is ~22MB, far exceeding the 1MB default limit
+    
+    all_video_frames = []
+    
     async with websockets.connect(server_uri, ping_interval=70, ping_timeout=70, max_size=None) as websocket:
         print(f"[Client {client_id}] Connected. Streaming {len(chunks)} chunks...")
         for i, chunk in enumerate(chunks):
@@ -36,9 +40,28 @@ async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate,
             result = await websocket.recv()
             print(f"[Client {client_id}] Received chunk {i+1}/{len(chunks)} ({len(result)} bytes)")
             
+            # 3. If this is Client 1, save the frames so we can compile a video at the end
+            if client_id == 1 and len(result) > 0:
+                # The server sends: float32 -> uint8 bytes back. Shape was (Time, Height, Width, Channels) implicitly
+                # Because the server sends `frames_np.tobytes()` from a [28, 512, 512, 3] numpy array
+                frame_array = np.frombuffer(result, dtype=np.uint8)
+                # Reshape back to T, H, W, C
+                frame_array = frame_array.reshape(-1, 512, 512, 3)
+                all_video_frames.append(frame_array)
+
             # Simulate real-time streaming delay (the time it takes for a real person to speak the chunk)
             chunk_duration = human_speech_array_slice_len / sample_rate
             await asyncio.sleep(chunk_duration * 0.5) # Speed it up slightly for testing
+            
+    # When streaming is done, compile the video for Client 1 so the user can see it works
+    if client_id == 1 and all_video_frames:
+        print(f"[Client {client_id}] Compiling saved chunks into an MP4 video...")
+        final_video_sequence = np.concatenate(all_video_frames, axis=0)
+        
+        # Save as MP4 using imageio
+        output_filename = "client1_concurrent_test.mp4"
+        imageio.mimwrite(output_filename, final_video_sequence, fps=tgt_fps, quality=8)
+        print(f"[Client {client_id}] SUCCESS! Video saved to {output_filename}")
 
 async def main():
     # Model config constraints (as per infer_params)
