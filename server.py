@@ -184,4 +184,5 @@ if __name__ == "__main__":
     import uvicorn
     # explicitly force the 'websockets' library for handling WS connections since Vast.ai drops it
     # We also extend the ping timeouts massively because the GPU batching might stall the main event loop
-    uvicorn.run(app, host="0.0.0.0", port=8000, ws="websockets", ws_ping_interval=70, ws_ping_timeout=70)
+    # We remove the max_size limit (None) because raw 28-frame chunks are ~22MB, shattering the 1MB default
+    uvicorn.run(app, host="0.0.0.0", port=8000, ws="websockets", ws_ping_interval=70, ws_ping_timeout=70, ws_max_size=None)

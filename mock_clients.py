@@ -23,7 +23,8 @@ async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate,
 
     print(f"[Client {client_id}] Connecting to {server_uri}...")
     # Increase ping timeout so the client doesn't drop the connection while the server GPU is busy
-    async with websockets.connect(server_uri, ping_interval=70, ping_timeout=70) as websocket:
+    # Set max_size to None because a chunk of 28 uncompressed RGB frames is ~22MB, far exceeding the 1MB default limit
+    async with websockets.connect(server_uri, ping_interval=70, ping_timeout=70, max_size=None) as websocket:
         print(f"[Client {client_id}] Connected. Streaming {len(chunks)} chunks...")
         for i, chunk in enumerate(chunks):
             # 1. Send floating point audio array
