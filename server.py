@@ -55,6 +55,9 @@ async def generation_worker():
             # Extract audio embeddings
             # (Note: audio_embedding uses the pipeline's internal Wav2Vec extractor)
             audio_embedding = get_audio_embedding(pipeline, audio_chunk, audio_start_idx, audio_end_idx)
+            
+            logger.info(f"[Audio Sync Debug] audio_chunk std: {audio_chunk.std():.5f}, max: {audio_chunk.max():.5f}")
+            logger.info(f"[Audio Sync Debug] audio_embedding shape: {audio_embedding.shape}, std: {audio_embedding.std().item():.5f}")
 
             # Generate video chunk statelessly - MUST BE RUN IN A THREAD!
             # If we run PyTorch directly here, it blocks the entire FastAPI asyncio loop
