@@ -80,24 +80,13 @@ async def generation_worker():
             normalized_frames = (((video_chunk + 1) / 2).permute(1, 2, 3, 0).clip(0, 1) * 255).contiguous()
 
             # Serialize and send back the frame bytes
-            # For this MVP, we convert the torch tensor to a raw byte array
             frames_np = normalized_frames.cpu().numpy().astype(np.uint8)
+            frame_bytes = frames_np.tobytes()
             
-            try:
-                if ws.client_state != WebSocketState.DISCONNECTED:
-                    await ws.send_bytes(frames_np.tobytes())
-            except RuntimeError as e:
-                # This happens if the client disconnects and the ASGI connection is already closed
-                logger.warning(f"Failed to send chunk for session {session_id}, dropping: {str(e)}")
-                # We can explicitly remove them from session manager cleanly
-                session_manager.delete_session(session_id)
-            except WebSocketDisconnect:
-                logger.warning(f"Client disconnected while sending chunk {session_id}")
-                session_manager.delete_session(session_id)
-            except Exception as e:
-                # Catch any unexpected socket closure Exceptions so we don't crash
-                logger.warning(f"Unexpected connection error while sending chunk to {session_id}: {str(e)}")
-                session_manager.delete_session(session_id)
+            # Place the finalized frames back into the user's dedicated response queue
+            response_queue = state.get("response_queue")
+            if response_queue:
+                response_queue.put_nowait(frame_bytes)
 
         except Exception as e:
             import traceback
@@ -155,50 +144,82 @@ async def stream_websocket(ws: WebSocket):
     session_id = str(id(ws)) # Simple unique session ID
 
     # Use the globally pre-compiled state so connection is instant
-    # Note: For multiple users in a real app, this state would be compiled per user based on
-    # their uploaded photo BEFORE they connect via WebSockets.
     state = global_initial_state_dict["girl"]
     
     # We must deep copy the state because multiple users cannot modify the same latents dictionary in memory
     import copy
     user_state = copy.deepcopy(state)
     
+    # Create the decoupled queue for this exact user session
+    response_queue = asyncio.Queue()
+    user_state["response_queue"] = response_queue
+    
     session_manager.create_session(session_id, user_state)
 
-    # Deque to handle sliding window audio padding, exact same as `generate_video.py`
+    # Deque to handle sliding window audio padding
     cached_audio_length_sum = sample_rate * cached_audio_duration
     audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
 
+    async def receive_audio():
+        """Listen strictly for incoming audio chunks from the client."""
+        try:
+            while True:
+                data = await ws.receive_bytes()
+                chunk_array = np.frombuffer(data, dtype=np.float32)
+
+                # Pad if the client sent a chunk slightly smaller than expected
+                remainder = len(chunk_array) % human_speech_array_slice_len
+                if remainder > 0:
+                    pad_length = human_speech_array_slice_len - remainder
+                    chunk_array = np.concatenate([chunk_array, np.zeros(pad_length, dtype=chunk_array.dtype)])
+                
+                # Append to rolling deque
+                audio_dq.extend(chunk_array.tolist())
+                audio_array = np.array(audio_dq)
+
+                # Toss the request onto the global generation fire
+                await generation_queue.put({
+                    "session_id": session_id,
+                    "audio_chunk": audio_array,
+                    "websocket": ws # worker doesn't use this anymore, but leaving for legacy/state tracking
+                })
+        except WebSocketDisconnect:
+            logger.info(f"Client {session_id} disconnected normally during receive.")
+        except Exception as e:
+            logger.error(f"Error in receive loop for {session_id}: {e}")
+
+    async def send_video():
+        """Listen strictly for generated video frames and send them back."""
+        try:
+            while True:
+                # Wait for the worker to grant us our generated chunk bytes
+                video_bytes = await response_queue.get()
+                await ws.send_bytes(video_bytes)
+                response_queue.task_done()
+        except WebSocketDisconnect:
+            logger.info(f"Client {session_id} disconnected normally during send.")
+        except RuntimeError:
+             # Client closed mid-dispatch
+             pass
+        except Exception as e:
+            logger.error(f"Error in send loop for {session_id}: {e}")
+
+    # Run both the Receiver and the Sender concurrently linked to this active route scope!
+    # By using FIRST_COMPLETED, if the client drops connection and receive_audio() throws 
+    # a WebSocketDisconnect, the gather finishes and cleans up both tasks instantly.
     try:
-        while True:
-            # 1. Receive the audio segment from the client.
-            # Expecting raw float32 bytes for the audio array.
-            data = await ws.receive_bytes()
-            chunk_array = np.frombuffer(data, dtype=np.float32)
+        receive_task = asyncio.create_task(receive_audio())
+        send_task = asyncio.create_task(send_video())
+        
+        await asyncio.wait([receive_task, send_task], return_when=asyncio.FIRST_COMPLETED)
+        
+        # Cancel whatever didn't finish
+        receive_task.cancel()
+        send_task.cancel()
 
-            # Pad if the client sent a chunk slightly smaller than expected
-            remainder = len(chunk_array) % human_speech_array_slice_len
-            if remainder > 0:
-                pad_length = human_speech_array_slice_len - remainder
-                chunk_array = np.concatenate([chunk_array, np.zeros(pad_length, dtype=chunk_array.dtype)])
-            
-            # 2. Append to rolling deque
-            audio_dq.extend(chunk_array.tolist())
-            audio_array = np.array(audio_dq)
-
-            # 3. Queue the generation request
-            # This is non-blocking right here; we just wait for the worker to pick it up.
-            await generation_queue.put({
-                "session_id": session_id,
-                "audio_chunk": audio_array,
-                "websocket": ws
-            })
-
-    except WebSocketDisconnect:
-        logger.info(f"Client disconnected: {session_id}")
-        session_manager.delete_session(session_id)
-    except Exception as e:
-        logger.error(f"WebSocket Error: {str(e)}")
+    finally:
+        # Tear down! We only ever clean up here, when the ASGI route definitively dies.
+        logger.info(f"Tearing down session: {session_id}")
         session_manager.delete_session(session_id)
 
 if __name__ == "__main__":
