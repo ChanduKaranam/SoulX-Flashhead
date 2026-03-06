@@ -6,7 +6,6 @@ from loguru import logger
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from collections import deque
-import av
 
 from flash_head.inference import get_pipeline, get_infer_params, get_audio_embedding
 from server_utils import SessionManager
@@ -73,63 +72,14 @@ async def generation_worker():
             video_chunk = video_chunk[:, motion_frames_num:, :, :]
             
             # Normalize the PyTorch tensor from [-1, 1] float to [0, 255] uint8 RGB
+            # Math adapted directly from inference.run_pipeline
+            # shape was (C, T, H, W) -> we need (T, H, W, C) for imageio/cv2
             normalized_frames = (((video_chunk + 1) / 2).permute(1, 2, 3, 0).clip(0, 1) * 255).contiguous()
+
+            # Serialize and send back the frame bytes
+            # For this MVP, we convert the torch tensor to a raw byte array
             frames_np = normalized_frames.cpu().numpy().astype(np.uint8)
-
-            av_container = state["av_container"]
-            av_buffer = state["av_buffer"]
-            stream_v = state["stream_v"]
-            stream_a = state["stream_a"]
-            
-            # Remember the buffer position before we mux this chunk
-            av_buffer.seek(0, 2) # go to end
-            start_pos = av_buffer.tell()
-
-            # Encode Video
-            for t in range(frames_np.shape[0]):
-                frame_img = frames_np[t]
-                # PyAV expects (H, W, C) for ndarray
-                av_frame = av.VideoFrame.from_ndarray(frame_img, format='rgb24')
-                av_frame.pts = state["video_pts"]
-                av_frame.time_base = stream_v.time_base
-                state["video_pts"] += 1
-                
-                for packet in stream_v.encode(av_frame):
-                    av_container.mux(packet)
-            
-            # 2. ENCODE AUDIO CHUNK
-            # audio_chunk is float32, length = slice_len * sample_rate / tgt_fps
-            # We must only encode the 'raw' portion of the audio that corresponds to this generated chunk
-            # audio_chunk (from the queue) is already the padded slice
-            audio_samples = audio_chunk.reshape(1, -1) # PyAV expects (channels, samples)
-            
-            # Create AudioFrame from numpy array
-            av_audio_frame = av.AudioFrame.from_ndarray(audio_samples, format='flt', layout='mono')
-            av_audio_frame.sample_rate = sample_rate
-            av_audio_frame.pts = state["audio_pts"]
-            av_audio_frame.time_base = stream_a.time_base
-            # update audio pts by the number of samples
-            state["audio_pts"] += audio_samples.shape[1] 
-            
-            for packet in stream_a.encode(av_audio_frame):
-                av_container.mux(packet)
-            
-            # Flush (MPEG-TS is a streaming container, so it's relatively safe to push bytes as we go)
-            # Read the newly written bytes from the buffer
-            av_buffer.seek(start_pos)
-            muxed_bytes = av_buffer.read()
-            
-            # CLEAR THE BUFFER so we don't hold the entire video history in RAM 
-            # and resend the history on every chunk
-            av_buffer.seek(0)
-            av_buffer.truncate(0)
-            # Because we truncated the underlying python buffer, we must tell PyAV 
-            # to reset its internal pointers so the next mux appended starts at byte 0
-            state["av_container"].seek(0)
-            
-            # Send the encoded MPEG-TS chunk back to the client!
-            if muxed_bytes:
-                await ws.send_bytes(muxed_bytes)
+            await ws.send_bytes(frames_np.tobytes())
 
         except Exception as e:
             import traceback

@@ -2,6 +2,10 @@ import asyncio
 import websockets
 import librosa
 import numpy as np
+import imageio
+import subprocess
+import os
+
 async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate, tgt_fps):
     """
     Connects to the server and streams audio chunks simulating a real-time microphone.
@@ -26,16 +30,8 @@ async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate,
     
     all_video_frames = []
     
-    # We will write the incoming MPEG-TS stream directly to a file
-    output_filename = f"client{client_id}_concurrent_test.ts"
-    print(f"[Client {client_id}] Connected. Output will be saved to {output_filename}")
-    
-    # Overwrite the file initially to clear any old runs
-    with open(output_filename, "wb") as f:
-        pass
-
     async with websockets.connect(server_uri, ping_interval=70, ping_timeout=70, max_size=None) as websocket:
-        print(f"[Client {client_id}] Streaming {len(chunks)} chunks...")
+        print(f"[Client {client_id}] Connected. Streaming {len(chunks)} chunks...")
         for i, chunk in enumerate(chunks):
             # 1. Send floating point audio array
             chunk_bytes = chunk.astype(np.float32).tobytes()
@@ -45,17 +41,41 @@ async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate,
             result = await websocket.recv()
             print(f"[Client {client_id}] Received chunk {i+1}/{len(chunks)} ({len(result)} bytes)")
             
-            # 3. Append the raw MPEG-TS chunk directly to the file
+            # 3. Append the raw frames for local compilation
             if len(result) > 0:
-                with open(output_filename, "ab") as f:
-                    f.write(result)
+                frame_array = np.frombuffer(result, dtype=np.uint8)
+                frame_array = frame_array.reshape(-1, 512, 512, 3)
+                all_video_frames.append(frame_array)
 
             # Simulate real-time streaming delay (the time it takes for a real person to speak the chunk)
             chunk_duration = human_speech_array_slice_len / sample_rate
             await asyncio.sleep(chunk_duration * 0.5) # Speed it up slightly for testing
             
-    # When streaming is done, the video is already compiled on disk!
-    print(f"[Client {client_id}] SUCCESS! Video fully streamed and saved to {output_filename}")
+    # When streaming is done, compile the video
+    if all_video_frames:
+        temp_video = f"client{client_id}_temp.mp4"
+        final_video = f"client{client_id}_concurrent_test.mp4"
+        
+        print(f"[Client {client_id}] Compiling saved chunks into {temp_video} ...")
+        final_video_sequence = np.concatenate(all_video_frames, axis=0)
+        imageio.mimwrite(temp_video, final_video_sequence, fps=tgt_fps, quality=8)
+        
+        print(f"[Client {client_id}] Stitching original audio to {final_video} via FFmpeg ...")
+        # Use FFmpeg to combine the temp video completely seamlessly with the source audio
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", temp_video,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            final_video
+        ], check=True)
+        
+        # Clean up the silent temp video
+        if os.path.exists(temp_video):
+            os.remove(temp_video)
+            
+        print(f"[Client {client_id}] SUCCESS! Video saved to {final_video}")
 
 async def main():
     # Model config constraints (as per infer_params)
