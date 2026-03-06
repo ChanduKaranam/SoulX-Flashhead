@@ -237,6 +237,8 @@ async def stream_websocket(ws: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     # explicitly force the 'websockets' library for handling WS connections since Vast.ai drops it
-    # We also extend the ping timeouts massively because the GPU batching might stall the main event loop
+    # We DISABLE ping_interval (None) because Uvicorn's background healthcheck task has a known concurrency
+    # bug where it tries to write a PING/PONG frame to the raw socket at the exact same moment that our
+    # foreground send_video() task is writing a 22MB uncompressed video payload, causing an AssertionError.
     # We remove the max_size limit (None) because raw 28-frame chunks are ~22MB, shattering the 1MB default
-    uvicorn.run(app, host="0.0.0.0", port=8000, ws="websockets", ws_ping_interval=70, ws_ping_timeout=70, ws_max_size=None)
+    uvicorn.run(app, host="0.0.0.0", port=8000, ws="websockets", ws_ping_interval=None, ws_ping_timeout=None, ws_max_size=None)

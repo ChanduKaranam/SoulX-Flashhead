@@ -29,8 +29,9 @@ async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate,
     # Set max_size to None because a chunk of 28 uncompressed RGB frames is ~22MB, far exceeding the 1MB default limit
     
     all_video_frames = []
-    
-    async with websockets.connect(server_uri, ping_interval=70, ping_timeout=70, max_size=None) as websocket:
+    # We DISABLE ping_interval (None) because Uvicorn's websockets auto-pong task crashes
+    # when it collides with a massive video payload chunk send_bytes call.
+    async with websockets.connect(server_uri, ping_interval=None, ping_timeout=None, max_size=None) as websocket:
         print(f"[Client {client_id}] Connected. Streaming {len(chunks)} chunks...")
         for i, chunk in enumerate(chunks):
             # 1. Send floating point audio array
