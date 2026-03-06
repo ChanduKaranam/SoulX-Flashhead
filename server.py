@@ -150,6 +150,12 @@ async def stream_websocket(ws: WebSocket):
     import copy
     user_state = copy.deepcopy(state)
     
+    # OVERRIDE the copied generator state with a brand new seed just for this user!
+    import random
+    user_seed = random.randint(0, 1000000)
+    user_gen = torch.Generator(device=pipeline.device).manual_seed(user_seed)
+    user_state["generator_state"] = user_gen.get_state().cpu()
+    
     # Create the decoupled queue for this exact user session
     response_queue = asyncio.Queue()
     user_state["response_queue"] = response_queue

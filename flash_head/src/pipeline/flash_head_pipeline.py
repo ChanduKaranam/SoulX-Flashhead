@@ -366,10 +366,12 @@ class FlashHeadPipeline:
             
             latent_motion_frames = ref_img_latent[:, :1].clone()
 
+            session_gen = torch.Generator(device=self.device).manual_seed(seed)
             state_dict[person_name] = {
                 "original_color_reference": cond_image_tensor.cpu(),
                 "ref_img_latent": ref_img_latent.cpu(),
-                "latent_motion_frames": latent_motion_frames.cpu()
+                "latent_motion_frames": latent_motion_frames.cpu(),
+                "generator_state": session_gen.get_state().cpu()
             }
 
         return state_dict
@@ -386,6 +388,9 @@ class FlashHeadPipeline:
         latent_motion_frames = session_state["latent_motion_frames"].to(self.device)
         audio_embedding = audio_embedding.to(self.device)
 
+        session_generator = torch.Generator(device=self.device)
+        session_generator.set_state(session_state["generator_state"])
+
         # evaluation mode
         with torch.no_grad():
             # sample videos
@@ -396,7 +401,7 @@ class FlashHeadPipeline:
                 self.lat_w,
                 dtype=self.param_dtype,
                 device=self.device,
-                generator=self.generator)
+                generator=session_generator)
 
             for i in range(len(self.timesteps)-1):
                 torch.cuda.synchronize()
@@ -430,7 +435,7 @@ class FlashHeadPipeline:
                     t_i_1 = (self.timesteps[i+1][:, None, None, None] / self.num_timesteps).to(self.param_dtype)
                     x_0 = noise - flow_pred * t_i
 
-                    noise = (1 - t_i_1) * x_0 + t_i_1 * torch.randn(x_0.size(), dtype=x_0.dtype, device=self.device, generator=self.generator)
+                    noise = (1 - t_i_1) * x_0 + t_i_1 * torch.randn(x_0.size(), dtype=x_0.dtype, device=self.device, generator=session_generator)
 
                 torch.cuda.synchronize()
                 end_time = time.time()
@@ -462,6 +467,7 @@ class FlashHeadPipeline:
 
         # Update Session State
         session_state["latent_motion_frames"] = latent_motion_frames.cpu()
+        session_state["generator_state"] = session_generator.get_state().cpu()
 
         return videos[0].to(torch.float32), session_state
 
