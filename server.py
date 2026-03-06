@@ -42,8 +42,11 @@ async def generation_worker():
         audio_chunk = request["audio_chunk"]  # np.array
         ws = request["websocket"]
 
+        from starlette.websockets import WebSocketState
+        
         state = session_manager.get_session(session_id)
-        if not state:
+        # Check if session is deleted, OR if the websocket has disconnected
+        if not state or ws.client_state == WebSocketState.DISCONNECTED:
             generation_queue.task_done()
             continue
 
@@ -81,7 +84,8 @@ async def generation_worker():
             frames_np = normalized_frames.cpu().numpy().astype(np.uint8)
             
             try:
-                await ws.send_bytes(frames_np.tobytes())
+                if ws.client_state != WebSocketState.DISCONNECTED:
+                    await ws.send_bytes(frames_np.tobytes())
             except RuntimeError as e:
                 # This happens if the client disconnects and the ASGI connection is already closed
                 logger.warning(f"Failed to send chunk for session {session_id}, dropping: {str(e)}")
@@ -90,10 +94,14 @@ async def generation_worker():
             except WebSocketDisconnect:
                 logger.warning(f"Client disconnected while sending chunk {session_id}")
                 session_manager.delete_session(session_id)
+            except Exception as e:
+                # Catch any unexpected socket closure Exceptions so we don't crash
+                logger.warning(f"Unexpected connection error while sending chunk to {session_id}: {str(e)}")
+                session_manager.delete_session(session_id)
 
         except Exception as e:
             import traceback
-            logger.error(f"Error in generation worker:\n{traceback.format_exc()}")
+            logger.error(f"Error in generation worker: {e}\n{traceback.format_exc()}")
         finally:
             generation_queue.task_done()
 
