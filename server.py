@@ -160,62 +160,68 @@ async def stream_websocket(ws: WebSocket):
     cached_audio_length_sum = sample_rate * cached_audio_duration
     audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
 
+    stop_event = asyncio.Event()
+
     async def receive_audio():
         """Listen strictly for incoming audio chunks from the client."""
         try:
-            while True:
+            while not stop_event.is_set():
                 data = await ws.receive_bytes()
                 chunk_array = np.frombuffer(data, dtype=np.float32)
 
-                # Pad if the client sent a chunk slightly smaller than expected
                 remainder = len(chunk_array) % human_speech_array_slice_len
                 if remainder > 0:
                     pad_length = human_speech_array_slice_len - remainder
                     chunk_array = np.concatenate([chunk_array, np.zeros(pad_length, dtype=chunk_array.dtype)])
                 
-                # Append to rolling deque
                 audio_dq.extend(chunk_array.tolist())
                 audio_array = np.array(audio_dq)
 
-                # Toss the request onto the global generation fire
                 await generation_queue.put({
                     "session_id": session_id,
                     "audio_chunk": audio_array,
-                    "websocket": ws # worker doesn't use this anymore, but leaving for legacy/state tracking
+                    "websocket": ws
                 })
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected normally during receive.")
         except Exception as e:
-            logger.error(f"Error in receive loop for {session_id}: {e}")
+            if not stop_event.is_set():
+                logger.error(f"Error in receive loop for {session_id}: {e}")
+        finally:
+            stop_event.set()
 
     async def send_video():
         """Listen strictly for generated video frames and send them back."""
         try:
-            while True:
-                # Wait for the worker to grant us our generated chunk bytes
-                video_bytes = await response_queue.get()
-                await ws.send_bytes(video_bytes)
-                response_queue.task_done()
+            while not stop_event.is_set():
+                # Wait with a timeout so we can periodically check stop_event
+                try:
+                    video_bytes = await asyncio.wait_for(response_queue.get(), timeout=1.0)
+                    await ws.send_bytes(video_bytes)
+                    response_queue.task_done()
+                except asyncio.TimeoutError:
+                    continue
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected normally during send.")
         except RuntimeError:
-             # Client closed mid-dispatch
-             pass
+             pass # Client closed mid-dispatch
         except Exception as e:
-            logger.error(f"Error in send loop for {session_id}: {e}")
+            if not stop_event.is_set():
+                logger.error(f"Error in send loop for {session_id}: {e}")
+        finally:
+            stop_event.set()
 
-    # Run both the Receiver and the Sender concurrently linked to this active route scope!
-    # By using FIRST_COMPLETED, if the client drops connection and receive_audio() throws 
-    # a WebSocketDisconnect, the gather finishes and cleans up both tasks instantly.
     try:
         receive_task = asyncio.create_task(receive_audio())
         send_task = asyncio.create_task(send_video())
         
         await asyncio.wait([receive_task, send_task], return_when=asyncio.FIRST_COMPLETED)
         
-        # Cancel whatever didn't finish
-        receive_task.cancel()
-        send_task.cancel()
+        # Signal tasks to stop gracefully
+        stop_event.set()
+        
+        # Give send_video a tiny window to finish its timeout and exit cleanly without being violently cancelled
+        await asyncio.sleep(0.1)
 
     finally:
         # Tear down! We only ever clean up here, when the ASGI route definitively dies.
