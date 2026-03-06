@@ -22,7 +22,8 @@ async def mock_client(client_id, audio_path, server_uri, slice_len, sample_rate,
     chunks = audio_data.reshape(-1, human_speech_array_slice_len)
 
     print(f"[Client {client_id}] Connecting to {server_uri}...")
-    async with websockets.connect(server_uri) as websocket:
+    # Increase ping timeout so the client doesn't drop the connection while the server GPU is busy
+    async with websockets.connect(server_uri, ping_interval=70, ping_timeout=70) as websocket:
         print(f"[Client {client_id}] Connected. Streaming {len(chunks)} chunks...")
         for i, chunk in enumerate(chunks):
             # 1. Send floating point audio array

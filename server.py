@@ -56,8 +56,13 @@ async def generation_worker():
             # (Note: audio_embedding uses the pipeline's internal Wav2Vec extractor)
             audio_embedding = get_audio_embedding(pipeline, audio_chunk, audio_start_idx, audio_end_idx)
 
-            # Generate video chunk statelessly
-            video_chunk, updated_state = pipeline.generate_stateless(audio_embedding, state)
+            # Generate video chunk statelessly - MUST BE RUN IN A THREAD!
+            # If we run PyTorch directly here, it blocks the entire FastAPI asyncio loop
+            # and prevents WebSockets from successfully sending/receiving keepalive pings.
+            def _sync_generate():
+                return pipeline.generate_stateless(audio_embedding, state)
+            
+            video_chunk, updated_state = await asyncio.to_thread(_sync_generate)
             
             # Only return the non-motion frames to the user (the actual new generated sequence)
             video_chunk = video_chunk[motion_frames_num:]
@@ -176,4 +181,5 @@ async def stream_websocket(ws: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     # explicitly force the 'websockets' library for handling WS connections since Vast.ai drops it
-    uvicorn.run(app, host="0.0.0.0", port=8000, ws="websockets")
+    # We also extend the ping timeouts massively because the GPU batching might stall the main event loop
+    uvicorn.run(app, host="0.0.0.0", port=8000, ws="websockets", ws_ping_interval=70, ws_ping_timeout=70)
