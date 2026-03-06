@@ -19,16 +19,15 @@ session_manager = SessionManager()
 # Global generation queue to serialize GPU requests for the single pipeline
 generation_queue = asyncio.Queue()
 
-# Inference parameters to initialize audio extraction
-infer_params = get_infer_params()
-sample_rate = infer_params['sample_rate']
-tgt_fps = infer_params['tgt_fps']
-cached_audio_duration = infer_params['cached_audio_duration']
-frame_num = infer_params['frame_num']
-motion_frames_num = infer_params['motion_frames_num']
-slice_len = frame_num - motion_frames_num
-
-human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
+# Inference parameters to be initialized after pipeline loads
+infer_params = None
+sample_rate = 16000
+tgt_fps = 25
+cached_audio_duration = 0
+frame_num = 0
+motion_frames_num = 0
+slice_len = 0
+human_speech_array_slice_len = 0
 
 async def generation_worker():
     """
@@ -78,7 +77,9 @@ async def generation_worker():
 
 @app.on_event("startup")
 async def startup_event():
-    global pipeline
+    global pipeline, infer_params, sample_rate, tgt_fps, cached_audio_duration
+    global frame_num, motion_frames_num, slice_len, human_speech_array_slice_len
+
     logger.info("Loading Pipeline into GPU...")
     # These paths are based on the original README setup
     ckpt_dir = "models/SoulX-FlashHead-1_3B"
@@ -86,7 +87,18 @@ async def startup_event():
     model_type = "lite" 
 
     pipeline = get_pipeline(world_size=1, ckpt_dir=ckpt_dir, wav2vec_dir=wav2vec_dir, model_type=model_type)
-    logger.info("Pipeline Loaded Successfully. Spinning up worker.")
+    
+    # Now that pipeline is initialized, inference.py has computed the internal params
+    infer_params = get_infer_params()
+    sample_rate = infer_params['sample_rate']
+    tgt_fps = infer_params['tgt_fps']
+    cached_audio_duration = infer_params['cached_audio_duration']
+    frame_num = infer_params['frame_num']
+    motion_frames_num = infer_params['motion_frames_num']
+    slice_len = frame_num - motion_frames_num
+    human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
+
+    logger.info(f"Pipeline Loaded Successfully. Spinning up worker. Slice size: {slice_len}")
     
     # Start the continuous worker
     asyncio.create_task(generation_worker())
