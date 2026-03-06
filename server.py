@@ -165,4 +165,5 @@ async def stream_websocket(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # explicitly force the 'websockets' library for handling WS connections since Vast.ai drops it
+    uvicorn.run(app, host="0.0.0.0", port=8000, ws="websockets")
