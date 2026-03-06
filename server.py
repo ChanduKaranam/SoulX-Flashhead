@@ -65,7 +65,9 @@ async def generation_worker():
             video_chunk, updated_state = await asyncio.to_thread(_sync_generate)
             
             # Only return the non-motion frames to the user (the actual new generated sequence)
-            video_chunk = video_chunk[motion_frames_num:]
+            # video_chunk shape is (Channels, Time, Height, Width)
+            # We slice the Time dimension to remove the prepended context frames
+            video_chunk = video_chunk[:, motion_frames_num:, :, :]
             
             # Save updated state
             session_manager.update_session(session_id, updated_state)
