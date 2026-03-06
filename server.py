@@ -69,13 +69,14 @@ async def generation_worker():
             # We slice the Time dimension to remove the prepended context frames
             video_chunk = video_chunk[:, motion_frames_num:, :, :]
             
-            # Save updated state
-            session_manager.update_session(session_id, updated_state)
+            # Normalize the PyTorch tensor from [-1, 1] float to [0, 255] uint8 RGB
+            # Math adapted directly from inference.run_pipeline
+            # shape was (C, T, H, W) -> we need (T, H, W, C) for imageio/cv2
+            normalized_frames = (((video_chunk + 1) / 2).permute(1, 2, 3, 0).clip(0, 1) * 255).contiguous()
 
             # Serialize and send back the frame bytes
             # For this MVP, we convert the torch tensor to a raw byte array
-            # In production, this would be encoded to h264 chunks via ffmpeg or PyAV
-            frames_np = video_chunk.cpu().numpy().astype(np.uint8)
+            frames_np = normalized_frames.cpu().numpy().astype(np.uint8)
             await ws.send_bytes(frames_np.tobytes())
 
         except Exception as e:
