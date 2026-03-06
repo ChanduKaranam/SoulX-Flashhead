@@ -72,7 +72,8 @@ async def generation_worker():
             await ws.send_bytes(frames_np.tobytes())
 
         except Exception as e:
-            logger.error(f"Error in generation worker: {str(e)}")
+            import traceback
+            logger.error(f"Error in generation worker:\n{traceback.format_exc()}")
         finally:
             generation_queue.task_done()
 
