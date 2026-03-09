@@ -170,22 +170,33 @@ async def stream_websocket(ws: WebSocket):
         avatar_name = config.get("avatar", "girl") # Default to girl if not specified
     except Exception as e:
         logger.error(f"Client {session_id} failed handshake parsing: {e}")
-        await ws.close(code=1003, reason="Invalid handshake payload")
+        # Removed `reason` kwarg as older starlette versions may throw TypeError
+        await ws.close(code=1003)
         return
 
     logger.info(f"Client {session_id} connected. Requested avatar: '{avatar_name}'")
 
-    if avatar_name not in global_initial_state_dict:
-        logger.error(f"Requested avatar '{avatar_name}' not found in cached initial states! Available: {list(global_initial_state_dict.keys())}")
-        await ws.close(code=1008, reason="Avatar not found")
+    if not global_initial_state_dict:
+        logger.error("Server has NO pre-computed avatars available!")
+        await ws.close(code=1011)
         return
+
+    if avatar_name not in global_initial_state_dict:
+        logger.warning(f"Requested avatar '{avatar_name}' not found in cached initial states! Available: {list(global_initial_state_dict.keys())}")
+        fallback_avatar = list(global_initial_state_dict.keys())[0]
+        logger.warning(f"Falling back gracefully to: '{fallback_avatar}'")
+        avatar_name = fallback_avatar
 
     # Use the globally pre-compiled state so connection is instant
     state = global_initial_state_dict[avatar_name]
     
-    # We must deep copy the state because multiple users cannot modify the same latents dictionary in memory
-    import copy
-    user_state = copy.deepcopy(state)
+    # We must clone the state because multiple users cannot modify the same latents tensor in memory!
+    # Explicitly using .clone() instead of copy.deepcopy to prevent obscure Starlette route crashes
+    user_state = {
+        "original_color_reference": state["original_color_reference"].clone(),
+        "ref_img_latent": state["ref_img_latent"].clone(),
+        "latent_motion_frames": state["latent_motion_frames"].clone()
+    }
     
     # OVERRIDE the copied generator state with a brand new seed just for this user!
     import random
