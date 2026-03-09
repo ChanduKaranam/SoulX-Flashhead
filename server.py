@@ -39,6 +39,14 @@ async def generation_worker():
     while True:
         request = await generation_queue.get()
         session_id = request["session_id"]
+
+        if request.get("EOF"):
+            state = session_manager.get_session(session_id)
+            if state and state.get("response_queue"):
+                state["response_queue"].put_nowait(b"EOF")
+            generation_queue.task_done()
+            continue
+
         audio_chunk = request["audio_chunk"]  # np.array
         ws = request["websocket"]
 
@@ -176,6 +184,26 @@ async def stream_websocket(ws: WebSocket):
         try:
             while not stop_event.is_set():
                 data = await ws.receive_bytes()
+
+                if data == b"EOF":
+                    logger.info(f"Client {session_id} explicitly signaled EOF. Flushing buffer.")
+                    if len(session_audio_buffer) > 0:
+                        remainder = len(session_audio_buffer) % human_speech_array_slice_len
+                        if remainder > 0:
+                            pad_length = human_speech_array_slice_len - remainder
+                            session_audio_buffer.extend([0.0] * pad_length)
+                        exact_slice = session_audio_buffer[:human_speech_array_slice_len]
+                        audio_dq.extend(exact_slice)
+                        audio_array = np.array(audio_dq)
+                        await generation_queue.put({
+                            "session_id": session_id,
+                            "audio_chunk": audio_array,
+                            "websocket": ws
+                        })
+                    # Pilot EOF to generation queue
+                    await generation_queue.put({"session_id": session_id, "EOF": True})
+                    continue # Hang here until the server ultimately closes the socket for us!
+
                 # 1. Append raw bytes to session buffer
                 chunk_array = np.frombuffer(data, dtype=np.float32)
                 session_audio_buffer.extend(chunk_array.tolist())
@@ -199,22 +227,7 @@ async def stream_websocket(ws: WebSocket):
                         "websocket": ws
                     })
         except WebSocketDisconnect:
-            logger.info(f"Client {session_id} disconnected normally during receive. Flushing buffer.")
-            # Flush whatever is left in the buffer by zero-padding it up to the required length
-            if len(session_audio_buffer) > 0:
-                remainder = len(session_audio_buffer) % human_speech_array_slice_len
-                pad_length = human_speech_array_slice_len - remainder
-                session_audio_buffer.extend([0.0] * pad_length)
-                
-                exact_slice = session_audio_buffer[:human_speech_array_slice_len]
-                audio_dq.extend(exact_slice)
-                audio_array = np.array(audio_dq)
-
-                await generation_queue.put({
-                    "session_id": session_id,
-                    "audio_chunk": audio_array,
-                    "websocket": ws
-                })
+            logger.info(f"Client {session_id} disconnected normally during receive. They did not wait for the end.")
         except Exception as e:
             if not stop_event.is_set():
                 logger.error(f"Error in receive loop for {session_id}: {e}")
@@ -228,6 +241,9 @@ async def stream_websocket(ws: WebSocket):
                 # Wait with a timeout so we can periodically check stop_event
                 try:
                     video_bytes = await asyncio.wait_for(response_queue.get(), timeout=1.0)
+                    if video_bytes == b"EOF":
+                        logger.info(f"All video generated for {session_id}. Closing output loop gracefully.")
+                        break
                     await ws.send_bytes(video_bytes)
                     response_queue.task_done()
                 except asyncio.TimeoutError:

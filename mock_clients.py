@@ -51,6 +51,7 @@ async def mock_client(client_id, audio_path, server_uri, chunk_duration_sec, sam
                     await asyncio.sleep(chunk_duration_sec * 0.9) # Slightly faster than real-time
 
                 print(f"[Client {client_id}] Finished streaming audio. Awaiting final video frames...")
+                await websocket.send(b"EOF")
             except websockets.exceptions.ConnectionClosed:
                 print(f"[Client {client_id}] Server closed connection during send.")
             except Exception as e:
