@@ -162,9 +162,12 @@ async def stream_websocket(ws: WebSocket):
     
     session_manager.create_session(session_id, user_state)
 
-    # Deque to handle sliding window audio padding
+    # Deque to handle sliding window audio padding (exact same as original generate_video.py)
     cached_audio_length_sum = sample_rate * cached_audio_duration
     audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
+    
+    # Decouple incoming network bytes from the strict pipeline slice length
+    session_audio_buffer = []
 
     stop_event = asyncio.Event()
 
@@ -173,14 +176,38 @@ async def stream_websocket(ws: WebSocket):
         try:
             while not stop_event.is_set():
                 data = await ws.receive_bytes()
+                # 1. Append raw bytes to session buffer
                 chunk_array = np.frombuffer(data, dtype=np.float32)
+                session_audio_buffer.extend(chunk_array.tolist())
 
-                remainder = len(chunk_array) % human_speech_array_slice_len
-                if remainder > 0:
-                    pad_length = human_speech_array_slice_len - remainder
-                    chunk_array = np.concatenate([chunk_array, np.zeros(pad_length, dtype=chunk_array.dtype)])
+                # 2. Consume exactly `human_speech_array_slice_len` from the buffer when available
+                while len(session_audio_buffer) >= human_speech_array_slice_len:
+                    # Slice exactly the length we need
+                    exact_slice = session_audio_buffer[:human_speech_array_slice_len]
+                    
+                    # Remove the consumed part from the buffer
+                    del session_audio_buffer[:human_speech_array_slice_len]
+                    
+                    # Push it into the model's sliding window
+                    audio_dq.extend(exact_slice)
+                    audio_array = np.array(audio_dq)
+
+                    # Enqueue the valid generation slice to the GPU worker queue
+                    await generation_queue.put({
+                        "session_id": session_id,
+                        "audio_chunk": audio_array,
+                        "websocket": ws
+                    })
+        except WebSocketDisconnect:
+            logger.info(f"Client {session_id} disconnected normally during receive. Flushing buffer.")
+            # Flush whatever is left in the buffer by zero-padding it up to the required length
+            if len(session_audio_buffer) > 0:
+                remainder = len(session_audio_buffer) % human_speech_array_slice_len
+                pad_length = human_speech_array_slice_len - remainder
+                session_audio_buffer.extend([0.0] * pad_length)
                 
-                audio_dq.extend(chunk_array.tolist())
+                exact_slice = session_audio_buffer[:human_speech_array_slice_len]
+                audio_dq.extend(exact_slice)
                 audio_array = np.array(audio_dq)
 
                 await generation_queue.put({
@@ -188,8 +215,6 @@ async def stream_websocket(ws: WebSocket):
                     "audio_chunk": audio_array,
                     "websocket": ws
                 })
-        except WebSocketDisconnect:
-            logger.info(f"Client {session_id} disconnected normally during receive.")
         except Exception as e:
             if not stop_event.is_set():
                 logger.error(f"Error in receive loop for {session_id}: {e}")
