@@ -6,16 +6,16 @@ import imageio
 import subprocess
 import os
 
-async def mock_client(client_id, audio_path, server_uri, chunk_duration_sec, sample_rate, tgt_fps):
+async def mock_client(client_id, avatar_name, audio_path, server_uri, chunk_duration_sec, sample_rate, tgt_fps):
     """
-    Connects to the server and streams generic audio chunks simulating a real-time microphone.
+    Connects to the server, sends an avatar configuration, and streams generic audio chunks simulating a real-time microphone.
     """
     # Simply stream raw audio in N-second increments. 
     # The server is now responsible for buffering and slicing it to exactly what the model needs.
     samples_per_chunk = int(chunk_duration_sec * sample_rate)
     
     # Load raw audio
-    print(f"[Client {client_id}] Loading {audio_path}...")
+    print(f"[Client {client_id}] Loading avatar '{avatar_name}' with audio '{audio_path}'...")
     audio_data, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
     
     # Pad to ensure even chunks
@@ -34,6 +34,12 @@ async def mock_client(client_id, audio_path, server_uri, chunk_duration_sec, sam
     # We DISABLE ping_interval (None) because Uvicorn's websockets auto-pong task crashes
     # when it collides with a massive video payload chunk send_bytes call.
     async with websockets.connect(server_uri, ping_interval=None, ping_timeout=None, max_size=None) as websocket:
+        import json
+        
+        # Handshake: Send avatar configuration first
+        config = {"avatar": avatar_name}
+        await websocket.send(json.dumps(config))
+        
         print(f"[Client {client_id}] Connected. Streaming {len(chunks)} chunks...")
 
         stop_event = asyncio.Event()
@@ -121,16 +127,25 @@ async def main():
     chunk_duration_sec = 0.25 # Send a quarter second of audio every network ping
     
     uri = "ws://localhost:8000/ws/stream"
-    audio_file = "examples/podcast_sichuan_16k.wav"
+    
+    # Mock heterogeneous configuration
+    # Note: These image basenames MUST exist in the server's 'examples/' directory
+    # Note: These audio files must exist locally
+    configs = [
+        {"id": 1, "avatar": "girl", "audio": "examples/podcast_sichuan_16k.wav"},
+        {"id": 2, "avatar": "boy", "audio": "examples/podcast_sichuan_16k.wav"},    # Fallback to same audio if you don't have multiple
+        {"id": 3, "avatar": "woman", "audio": "examples/podcast_sichuan_16k.wav"}, 
+    ]
 
     # Spin up 3 clients simultaneously to prove concurrent execution
     # For safety, we stagger their starts slightly.
-    print("Launching 3 concurrent clients...")
-    client1 = mock_client(1, audio_file, uri, chunk_duration_sec, sample_rate, tgt_fps)
-    client2 = mock_client(2, audio_file, uri, chunk_duration_sec, sample_rate, tgt_fps)
-    client3 = mock_client(3, audio_file, uri, chunk_duration_sec, sample_rate, tgt_fps)
+    print("Launching concurrent clients with heterogeneous configurations...")
+    clients = [
+        mock_client(conf["id"], conf["avatar"], conf["audio"], uri, chunk_duration_sec, sample_rate, tgt_fps)
+        for conf in configs
+    ]
 
-    await asyncio.gather(client1, client2, client3)
+    await asyncio.gather(*clients)
 
 if __name__ == "__main__":
     asyncio.run(main())

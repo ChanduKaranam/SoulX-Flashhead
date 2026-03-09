@@ -128,20 +128,31 @@ async def startup_event():
     logger.info(f"Pipeline Loaded Successfully. Spinning up worker. Slice size: {slice_len}")
     
     # Pre-compute the initial state dictionary globally so it doesn't block WebSockets
-    logger.info("Pre-computing initial latents for 'examples/girl.png'...")
+    logger.info("Scanning 'examples/' directory and pre-computing initial latents for all avatars...")
     global global_initial_state_dict
-    global_initial_state_dict = pipeline.prepare_params_stateless(
-        cond_image_path_or_dir="examples/girl.png",
-        target_size=(infer_params['height'], infer_params['width']),
-        frame_num=infer_params['frame_num'],
-        motion_frames_num=infer_params['motion_frames_num'],
-        sampling_steps=infer_params['sample_steps'],
-        seed=42,
-        shift=infer_params['sample_shift'],
-        color_correction_strength=infer_params['color_correction_strength'],
-        use_face_crop=False
-    )
-    logger.info("Initial latent state cached. Ready for client connections.")
+    
+    # We pass the directory path instead of a single file path.
+    # get_cond_image_dict inside pipeline.prepare_params_stateless will automatically
+    # find all PNGs and return a dictionary mapping `filename -> config`.
+    examples_dir = "examples"
+    if not os.path.exists(examples_dir):
+        logger.warning(f"Warning: Directory '{examples_dir}' not found. Initializing empty state.")
+        global_initial_state_dict = {}
+    else:
+        global_initial_state_dict = pipeline.prepare_params_stateless(
+            cond_image_path_or_dir=examples_dir,
+            target_size=(infer_params['height'], infer_params['width']),
+            frame_num=infer_params['frame_num'],
+            motion_frames_num=infer_params['motion_frames_num'],
+            sampling_steps=infer_params['sample_steps'],
+            seed=42,
+            shift=infer_params['sample_shift'],
+            color_correction_strength=infer_params['color_correction_strength'],
+            use_face_crop=False
+        )
+        
+    loaded_avatars = list(global_initial_state_dict.keys())
+    logger.info(f"Initial latent state cached for avatars: {loaded_avatars}. Ready for client connections.")
 
     # Start the continuous worker
     asyncio.create_task(generation_worker())
@@ -151,8 +162,26 @@ async def stream_websocket(ws: WebSocket):
     await ws.accept()
     session_id = str(id(ws)) # Simple unique session ID
 
+    # Read the first message as a configuration object to determine which avatar to use
+    try:
+        import json
+        config_msg = await ws.receive_text()
+        config = json.loads(config_msg)
+        avatar_name = config.get("avatar", "girl") # Default to girl if not specified
+    except Exception as e:
+        logger.error(f"Client {session_id} failed handshake parsing: {e}")
+        await ws.close(code=1003, reason="Invalid handshake payload")
+        return
+
+    logger.info(f"Client {session_id} connected. Requested avatar: '{avatar_name}'")
+
+    if avatar_name not in global_initial_state_dict:
+        logger.error(f"Requested avatar '{avatar_name}' not found in cached initial states! Available: {list(global_initial_state_dict.keys())}")
+        await ws.close(code=1008, reason="Avatar not found")
+        return
+
     # Use the globally pre-compiled state so connection is instant
-    state = global_initial_state_dict["girl"]
+    state = global_initial_state_dict[avatar_name]
     
     # We must deep copy the state because multiple users cannot modify the same latents dictionary in memory
     import copy
