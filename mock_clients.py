@@ -132,9 +132,9 @@ async def main():
     # Note: These image basenames MUST exist in the server's 'examples/' directory
     # Note: These audio files must exist locally
     configs = [
-        {"id": 1, "avatar": "girl", "audio": "examples/podcast_sichuan_16k.wav"},
-        {"id": 2, "avatar": "boy", "audio": "examples/podcast_sichuan_16k.wav"},    # Fallback to same audio if you don't have multiple
-        {"id": 3, "avatar": "woman", "audio": "examples/podcast_sichuan_16k.wav"}, 
+        {"id": 1, "avatar": "man1", "audio": "examples/man.wav"},
+        {"id": 2, "avatar": "woman2", "audio": "examples/woman.wav"},
+        {"id": 3, "avatar": "girl", "audio": "examples/podcast_sichuan_16k.wav"}, 
     ]
 
     # Spin up 3 clients simultaneously to prove concurrent execution

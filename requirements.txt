@@ -19,3 +19,4 @@ xformers==0.0.31
 librosa
 mediapipe==0.10.9
 flask
+websockets
