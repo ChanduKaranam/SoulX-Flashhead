@@ -342,9 +342,12 @@ def _run_async_generation(
                                 )
                                 result.add_frames(batch)
                     except websockets.exceptions.ConnectionClosedOK:
-                        pass
+                        pass  # Clean server shutdown — expected path
                     except websockets.exceptions.ConnectionClosedError as e:
-                        if result.error is None:
+                        # If we already received frames the server completed its work and
+                        # closed the connection (even if the close frame was missing).
+                        # Treat this as a successful finish rather than an error.
+                        if result.frames_received == 0 and result.error is None:
                             result.fail(f"Connection closed with error: {e}")
                     except Exception as e:
                         result.fail(f"Recv error: {e}")

@@ -17,8 +17,10 @@ pipeline = None
 session_manager = SessionManager()
 global_initial_state_dict = None
 
-# Global generation queue to serialize GPU requests for the single pipeline
-generation_queue = asyncio.Queue()
+# Per-session generation queues for round-robin scheduling.
+# Each active WebSocket session gets its own queue so no single user
+# monopolises the GPU worker — every session gets a turn each cycle.
+session_queues: dict = {}  # session_id -> asyncio.Queue
 
 # Inference parameters to be initialized after pipeline loads
 infer_params = None
@@ -32,75 +34,99 @@ human_speech_array_slice_len = 0
 
 async def generation_worker():
     """
-    Background worker that continuously pulls chunk requests from the queue and 
-    processes them one by one blazing fast using the stateless pipeline.
+    Round-robin generation worker.
+
+    Instead of a single global FIFO queue (which causes one user to monopolise
+    the GPU while others wait), each session registers its own queue.  The
+    worker cycles through every active session on each iteration, processing
+    exactly ONE chunk per session before moving to the next.  This interleaves
+    GPU work evenly so all concurrent users see frames arriving at the same time.
     """
-    logger.info("Generation Worker Started.")
+    from starlette.websockets import WebSocketState
+
+    logger.info("Round-Robin Generation Worker Started.")
     while True:
-        request = await generation_queue.get()
-        session_id = request["session_id"]
+        # Snapshot of active session IDs for this cycle
+        active_ids = list(session_queues.keys())
 
-        if request.get("EOF"):
+        if not active_ids:
+            # Nothing to do — yield control to the event loop briefly
+            await asyncio.sleep(0.01)
+            continue
+
+        any_processed = False
+
+        for session_id in active_ids:
+            q = session_queues.get(session_id)
+            if q is None or q.empty():
+                continue
+
+            try:
+                request = q.get_nowait()
+            except asyncio.QueueEmpty:
+                continue
+
+            any_processed = True
+
+            # ── EOF marker: signal the response queue to close ──────────────
+            if request.get("EOF"):
+                state = session_manager.get_session(session_id)
+                if state and state.get("response_queue"):
+                    state["response_queue"].put_nowait(b"EOF")
+                q.task_done()
+                continue
+
+            # ── Normal audio chunk ──────────────────────────────────────────
+            audio_chunk = request["audio_chunk"]
+            ws = request["websocket"]
+
             state = session_manager.get_session(session_id)
-            if state and state.get("response_queue"):
-                state["response_queue"].put_nowait(b"EOF")
-            generation_queue.task_done()
-            continue
+            if not state or ws.client_state == WebSocketState.DISCONNECTED:
+                q.task_done()
+                continue
 
-        audio_chunk = request["audio_chunk"]  # np.array
-        ws = request["websocket"]
+            try:
+                audio_end_idx = cached_audio_duration * tgt_fps
+                audio_start_idx = audio_end_idx - frame_num
 
-        from starlette.websockets import WebSocketState
-        
-        state = session_manager.get_session(session_id)
-        # Check if session is deleted, OR if the websocket has disconnected
-        if not state or ws.client_state == WebSocketState.DISCONNECTED:
-            generation_queue.task_done()
-            continue
+                audio_embedding = get_audio_embedding(
+                    pipeline, audio_chunk, audio_start_idx, audio_end_idx
+                )
 
-        try:
-            # Prepare streaming audio indices exactly as in the original generate_video script stream mode
-            audio_end_idx = cached_audio_duration * tgt_fps
-            audio_start_idx = audio_end_idx - frame_num
-            
-            # Extract audio embeddings
-            # (Note: audio_embedding uses the pipeline's internal Wav2Vec extractor)
-            audio_embedding = get_audio_embedding(pipeline, audio_chunk, audio_start_idx, audio_end_idx)
-            
-            logger.info(f"[Audio Sync Debug] audio_chunk std: {audio_chunk.std():.5f}, max: {audio_chunk.max():.5f}")
-            logger.info(f"[Audio Sync Debug] audio_embedding shape: {audio_embedding.shape}, std: {audio_embedding.std().item():.5f}")
+                logger.info(
+                    f"[{session_id}] audio_chunk std: {audio_chunk.std():.5f}  "
+                    f"embedding shape: {audio_embedding.shape}"
+                )
 
-            # Generate video chunk statelessly - MUST BE RUN IN A THREAD!
-            # If we run PyTorch directly here, it blocks the entire FastAPI asyncio loop
-            # and prevents WebSockets from successfully sending/receiving keepalive pings.
-            def _sync_generate():
-                return pipeline.generate_stateless(audio_embedding, state)
-            
-            video_chunk, updated_state = await asyncio.to_thread(_sync_generate)
-            # 1. ENCODE VIDEO FRAMES
-            # video_chunk shape is (Channels, Time, Height, Width) -> we need (Time, Height, Width, Channels) for av
-            # We slice the Time dimension to remove the prepended context frames
-            video_chunk = video_chunk[:, motion_frames_num:, :, :]
-            
-            # Normalize the PyTorch tensor from [-1, 1] float to [0, 255] uint8 RGB
-            # Math adapted directly from inference.run_pipeline
-            # shape was (C, T, H, W) -> we need (T, H, W, C) for imageio/cv2
-            normalized_frames = (((video_chunk + 1) / 2).permute(1, 2, 3, 0).clip(0, 1) * 255).contiguous()
+                def _sync_generate():
+                    return pipeline.generate_stateless(audio_embedding, state)
 
-            # Serialize and send back the frame bytes
-            frames_np = normalized_frames.cpu().numpy().astype(np.uint8)
-            frame_bytes = frames_np.tobytes()
-            
-            # Place the finalized frames back into the user's dedicated response queue
-            response_queue = state.get("response_queue")
-            if response_queue:
-                response_queue.put_nowait(frame_bytes)
+                video_chunk, updated_state = await asyncio.to_thread(_sync_generate)
 
-        except Exception as e:
-            import traceback
-            logger.error(f"Error in generation worker: {e}\n{traceback.format_exc()}")
-        finally:
-            generation_queue.task_done()
+                video_chunk = video_chunk[:, motion_frames_num:, :, :]
+                normalized_frames = (
+                    ((video_chunk + 1) / 2).permute(1, 2, 3, 0).clip(0, 1) * 255
+                ).contiguous()
+
+                frames_np = normalized_frames.cpu().numpy().astype(np.uint8)
+                frame_bytes = frames_np.tobytes()
+
+                response_queue = state.get("response_queue")
+                if response_queue:
+                    response_queue.put_nowait(frame_bytes)
+
+            except Exception as e:
+                import traceback
+                logger.error(
+                    f"Error processing chunk for {session_id}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
+            finally:
+                q.task_done()
+
+        if not any_processed:
+            # All queues were empty this cycle — yield briefly
+            await asyncio.sleep(0.01)
 
 @app.on_event("startup")
 async def startup_event():
@@ -162,6 +188,7 @@ async def list_avatars():
     """Returns the list of avatar names that have been pre-computed and are ready for streaming."""
     return {"avatars": list(global_initial_state_dict.keys())}
 
+
 @app.websocket("/ws/stream")
 async def stream_websocket(ws: WebSocket):
     await ws.accept()
@@ -209,11 +236,14 @@ async def stream_websocket(ws: WebSocket):
     user_gen = torch.Generator(device=pipeline.device).manual_seed(user_seed)
     user_state["generator_state"] = user_gen.get_state().cpu()
     
-    # Create the decoupled queue for this exact user session
+    # Create the decoupled response queue and per-session generation queue
     response_queue = asyncio.Queue()
     user_state["response_queue"] = response_queue
-    
+
     session_manager.create_session(session_id, user_state)
+
+    # Register this session in the round-robin scheduler
+    session_queues[session_id] = asyncio.Queue()
 
     # Deque to handle sliding window audio padding (exact same as original generate_video.py)
     cached_audio_length_sum = sample_rate * cached_audio_duration
@@ -240,14 +270,18 @@ async def stream_websocket(ws: WebSocket):
                         exact_slice = session_audio_buffer[:human_speech_array_slice_len]
                         audio_dq.extend(exact_slice)
                         audio_array = np.array(audio_dq)
-                        await generation_queue.put({
-                            "session_id": session_id,
-                            "audio_chunk": audio_array,
-                            "websocket": ws
-                        })
-                    # Pilot EOF to generation queue
-                    await generation_queue.put({"session_id": session_id, "EOF": True})
-                    continue # Hang here until the server ultimately closes the socket for us!
+                        q = session_queues.get(session_id)
+                        if q is not None:
+                            await q.put({
+                                "session_id": session_id,
+                                "audio_chunk": audio_array,
+                                "websocket": ws
+                            })
+                    # Pilot EOF to per-session queue
+                    q = session_queues.get(session_id)
+                    if q is not None:
+                        await q.put({"session_id": session_id, "EOF": True})
+                    continue  # Hang here until the server ultimately closes the socket for us!
 
                 # 1. Append raw bytes to session buffer
                 chunk_array = np.frombuffer(data, dtype=np.float32)
@@ -257,20 +291,22 @@ async def stream_websocket(ws: WebSocket):
                 while len(session_audio_buffer) >= human_speech_array_slice_len:
                     # Slice exactly the length we need
                     exact_slice = session_audio_buffer[:human_speech_array_slice_len]
-                    
+
                     # Remove the consumed part from the buffer
                     del session_audio_buffer[:human_speech_array_slice_len]
-                    
+
                     # Push it into the model's sliding window
                     audio_dq.extend(exact_slice)
                     audio_array = np.array(audio_dq)
 
-                    # Enqueue the valid generation slice to the GPU worker queue
-                    await generation_queue.put({
-                        "session_id": session_id,
-                        "audio_chunk": audio_array,
-                        "websocket": ws
-                    })
+                    # Enqueue to this session's own round-robin queue
+                    q = session_queues.get(session_id)
+                    if q is not None:
+                        await q.put({
+                            "session_id": session_id,
+                            "audio_chunk": audio_array,
+                            "websocket": ws
+                        })
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected normally during receive. They did not wait for the end.")
         except Exception as e:
@@ -303,22 +339,38 @@ async def stream_websocket(ws: WebSocket):
         finally:
             stop_event.set()
 
+    receive_task = None
+    send_task = None
     try:
         receive_task = asyncio.create_task(receive_audio())
         send_task = asyncio.create_task(send_video())
-        
+
         await asyncio.wait([receive_task, send_task], return_when=asyncio.FIRST_COMPLETED)
-        
-        # Signal tasks to stop gracefully
+
+        # Signal both coroutines to exit cleanly
         stop_event.set()
-        
-        # Give send_video a tiny window to finish its timeout and exit cleanly without being violently cancelled
-        await asyncio.sleep(0.1)
+
+        # Cancel whichever task is still pending so it doesn't linger as an
+        # orphan holding a reference to a socket that Starlette is about to
+        # close — this was the root cause of the 'no close frame' error.
+        for task in (receive_task, send_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(receive_task, send_task, return_exceptions=True)
 
     finally:
-        # Tear down! We only ever clean up here, when the ASGI route definitively dies.
-        logger.info(f"Tearing down session: {session_id}")
+        # Remove session from round-robin scheduler BEFORE closing the socket
+        # so the worker won't try to process stale entries for this session.
+        session_queues.pop(session_id, None)
         session_manager.delete_session(session_id)
+        logger.info(f"Tearing down session: {session_id}")
+
+        # Send a proper WebSocket close frame so the client receives
+        # ConnectionClosedOK instead of the abrupt 'no close frame' error.
+        try:
+            await ws.close(code=1000)
+        except Exception:
+            pass  # Already closed, nothing to do
 
 if __name__ == "__main__":
     import uvicorn
