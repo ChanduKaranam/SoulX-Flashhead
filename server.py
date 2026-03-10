@@ -157,6 +157,11 @@ async def startup_event():
     # Start the continuous worker
     asyncio.create_task(generation_worker())
 
+@app.get("/avatars")
+async def list_avatars():
+    """Returns the list of avatar names that have been pre-computed and are ready for streaming."""
+    return {"avatars": list(global_initial_state_dict.keys())}
+
 @app.websocket("/ws/stream")
 async def stream_websocket(ws: WebSocket):
     await ws.accept()
